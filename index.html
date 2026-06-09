@@ -278,7 +278,7 @@
         </main>
 
         <!-- IMMERSIVE CALL OVERLAY (LuminousClarity Immersive Design) -->
-        <div v-if="inCall" class="fixed inset-0 z-[1100] bg-slate-950 flex flex-col overflow-hidden text-white">
+        <div v-if="inCall" class="fixed inset-0 z-[1100] bg-slate-950 flex flex-col overflow-hidden text-white animate-fade-in">
             <!-- Pulsing Organic Ambient Background for Audio Calls -->
             <div v-if="callType === 'audio'" class="absolute inset-0 overflow-hidden pointer-events-none">
                 <div class="pulse-bg w-[500px] h-[500px] bg-blue-600/20 top-[-100px] left-[-100px] blur-[120px]"></div>
@@ -398,7 +398,7 @@
             <!-- Contact/Group Modal -->
             <div v-if="modalMode === 'contact' || modalMode === 'group'" class="bg-white rounded-[40px] w-full max-w-sm relative p-8 shadow-2xl" @click.stop>
                 <div class="flex gap-4 mb-8">
-                    <button @click="modalMode = 'contact'" :class="modalMode === 'contact' ? 'text-slate-900' : 'text-slate-300'" class="text-xs font-black uppercase tracking-widest transition-colors">連絡先</button>
+                    <button @click="modalMode === 'contact' ? modalMode = 'contact' : modalMode = 'group'" :class="modalMode === 'contact' ? 'text-slate-900' : 'text-slate-300'" class="text-xs font-black uppercase tracking-widest transition-colors">連絡先</button>
                     <button @click="modalMode = 'group'" :class="modalMode === 'group' ? 'text-slate-900' : 'text-slate-300'" class="text-xs font-black uppercase tracking-widest transition-colors">グループ</button>
                 </div>
                 <div v-if="modalMode === 'contact'">
@@ -439,7 +439,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-auth.js";
-        import { getFirestore, collection, addDoc, onSnapshot, query, serverTimestamp, orderBy, doc, setDoc, deleteDoc, getDoc, limit, updateDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, serverTimestamp, orderBy, doc, setDoc, deleteDoc, getDoc, limit, updateDoc, arrayUnion, arrayRemove, deleteField } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
         import { createApp, ref, onMounted, nextTick, computed } from "https://unpkg.com/vue@3/dist/vue.esm-browser.prod.js";
 
         const AUTH_URL = "https://noppo-auth.noppo5319.workers.dev";
@@ -540,7 +540,6 @@
 
                     // Listening to any WebRTC P2P direct call invitations
                     peerInstance.on('call', (incomingCall) => {
-                        // Accept and stream logic when active
                         if (inCall.value && localStream.value) {
                             incomingCall.answer(localStream.value);
                             handlePeerStream(incomingCall);
@@ -550,7 +549,33 @@
 
                 /* Keep listening to any incoming direct calls from contacts */
                 const listenToGlobalIncomingCalls = () => {
-                    // Monitor individual room changes or use a streamlined listener approach
+                    if (!db || !user.value) return;
+                    if (globalCallUnsub) globalCallUnsub();
+
+                    // Listen directly to the user's private incoming_call path
+                    const docRef = doc(db, 'artifacts', appId, 'users', user.value.email, 'incoming_call', 'current');
+                    globalCallUnsub = onSnapshot(docRef, (docSnap) => {
+                        if (docSnap.exists()) {
+                            const data = docSnap.data();
+                            incomingCallState.value = data;
+                            
+                            // If user is currently not on call, auto-resolve target chat matching
+                            if (!inCall.value && data.status === 'calling') {
+                                // Find chat target item
+                                const matched = items.value.find(i => i.email === data.initiator);
+                                if (matched) {
+                                    activeChat.value = matched;
+                                    syncActiveRoomCallState();
+                                } else {
+                                    // Fallback temp contact structure
+                                    activeChat.value = { email: data.initiator, name: data.initiatorName || data.initiator.split('@')[0], type: 'contact' };
+                                    syncActiveRoomCallState();
+                                }
+                            }
+                        } else {
+                            incomingCallState.value = null;
+                        }
+                    }, (err) => console.error("Global Call listener error:", err));
                 };
 
                 const syncSidebarData = () => {
@@ -618,10 +643,8 @@
                         if (docSnap.exists()) {
                             const data = docSnap.data();
                             activeRoomCall.value = data;
-                            incomingCallState.value = data;
                         } else {
                             activeRoomCall.value = null;
-                            incomingCallState.value = null;
                         }
                     });
                 };
@@ -629,7 +652,7 @@
                 /* Initiate Call Flow (Audio or Video) */
                 const initiateCall = async (type) => {
                     const roomId = getRoomId(activeChat.value);
-                    if (!db || !roomId || !user.value) return;
+                    if (!db || !roomId || !user.value || !activeChat.value) return;
 
                     try {
                         callType.value = type;
@@ -642,11 +665,12 @@
                         // Set states
                         inCall.value = true;
                         micActive.value = true;
-                        videoActive = type === 'video';
+                        videoActive.value = (type === 'video');
 
                         const localPeerId = btoa(user.value.email).replace(/=/g, '');
+                        const safeEmailKey = user.value.email.replace(/\./g, '_');
 
-                        // Push signaling block to Firestore
+                        // Push signaling block to Firestore room
                         const docRef = doc(db, 'artifacts', appId, 'rooms', roomId, 'call_state', 'current');
                         await setDoc(docRef, {
                             status: activeChat.value.type === 'group' ? 'active' : 'calling',
@@ -654,14 +678,30 @@
                             initiator: user.value.email,
                             initiatorName: user.value.userId,
                             participants: [user.value.email],
-                            peerIds: { [user.value.email]: localPeerId },
+                            peerIds: { [safeEmailKey]: localPeerId },
                             createdAt: serverTimestamp()
                         });
+
+                        // If DM, also write directly to the target user's custom incoming invite channel
+                        if (activeChat.value.type !== 'group') {
+                            const targetEmail = activeChat.value.email || activeChat.value.authorEmail;
+                            if (targetEmail) {
+                                const targetInviteRef = doc(db, 'artifacts', appId, 'users', targetEmail, 'incoming_call', 'current');
+                                await setDoc(targetInviteRef, {
+                                    status: 'calling',
+                                    roomId: roomId,
+                                    type: type,
+                                    initiator: user.value.email,
+                                    initiatorName: user.value.userId,
+                                    createdAt: serverTimestamp()
+                                });
+                            }
+                        }
 
                         startCallTimer();
                     } catch (err) {
                         console.error("Local media error:", err);
-                        alert("カメラかマイクの許可が得られないか、使用できません。");
+                        alert("カメラやマイクの権限をオンにしてください。");
                     }
                 };
 
@@ -679,23 +719,29 @@
 
                         inCall.value = true;
                         micActive.value = true;
-                        videoActive.value = callType.value === 'video';
+                        videoActive.value = (callType.value === 'video');
 
                         const localPeerId = btoa(user.value.email).replace(/=/g, '');
+                        const safeEmailKey = user.value.email.replace(/\./g, '_');
 
                         // Connect / Ring all existing participants (Mesh Setup)
-                        Object.entries(activeRoomCall.value.peerIds).forEach(([email, peerId]) => {
-                            if (email !== user.value.email) {
-                                const outboundCall = peerInstance.call(peerId, localStream.value);
-                                handlePeerStream(outboundCall, email);
-                            }
-                        });
+                        if (activeRoomCall.value.peerIds) {
+                            Object.entries(activeRoomCall.value.peerIds).forEach(([rawEmailKey, peerId]) => {
+                                const email = rawEmailKey.replace(/_/g, '.');
+                                if (email !== user.value.email) {
+                                    const outboundCall = peerInstance.call(peerId, localStream.value);
+                                    handlePeerStream(outboundCall, email);
+                                }
+                            });
+                        }
 
                         // Add ourselves to the Firestore active participants roster
                         const docRef = doc(db, 'artifacts', appId, 'rooms', roomId, 'call_state', 'current');
                         await setDoc(docRef, {
                             participants: arrayUnion(user.value.email),
-                            [`peerIds.${user.value.email.replace(/\./g, '_')}`]: localPeerId
+                            peerIds: {
+                                [safeEmailKey]: localPeerId
+                            }
                         }, { merge: true });
 
                         startCallTimer();
@@ -711,7 +757,6 @@
                     call.on('stream', (remoteMediaStream) => {
                         let email = specifiedEmail;
                         if (!email) {
-                            // Find email through decoding matching PeerID back
                             try {
                                 email = atob(call.peer);
                             } catch {
@@ -750,7 +795,7 @@
                 /* Incoming DM Call response: Accept */
                 const answerCall = async () => {
                     const roomId = getRoomId(activeChat.value);
-                    if (!db || !roomId || !incomingCallState.value) return;
+                    if (!db || !roomId || !incomingCallState.value || !user.value) return;
 
                     try {
                         callType.value = incomingCallState.value.type;
@@ -761,24 +806,44 @@
 
                         inCall.value = true;
                         micActive.value = true;
-                        videoActive.value = callType.value === 'video';
+                        videoActive.value = (callType.value === 'video');
 
                         const localPeerId = btoa(user.value.email).replace(/=/g, '');
+                        const safeEmailKey = user.value.email.replace(/\./g, '_');
 
                         // Signal status shift to connected on 1-on-1 calls
                         const docRef = doc(db, 'artifacts', appId, 'rooms', roomId, 'call_state', 'current');
                         await setDoc(docRef, {
                             status: 'active',
                             participants: arrayUnion(user.value.email),
-                            [`peerIds.${user.value.email.replace(/\./g, '_')}`]: localPeerId
+                            peerIds: {
+                                [safeEmailKey]: localPeerId
+                            }
                         }, { merge: true });
 
                         // Call initiator to trigger streaming setup
-                        const initiatorPeerId = incomingCallState.value.peerIds[incomingCallState.value.initiator];
-                        if (initiatorPeerId) {
-                            const outboundCall = peerInstance.call(initiatorPeerId, localStream.value);
-                            handlePeerStream(outboundCall, incomingCallState.value.initiator);
+                        if (incomingCallState.value.initiator) {
+                            const initiatorKey = incomingCallState.value.initiator.replace(/\./g, '_');
+                            // Get activeRoomCall peerId if available, fallback to incomingInvite fallback
+                            const docSnap = await getDoc(docRef);
+                            let initiatorPeerId = null;
+                            if (docSnap.exists()) {
+                                const callData = docSnap.data();
+                                initiatorPeerId = callData.peerIds?.[initiatorKey];
+                            }
+                            if (!initiatorPeerId) {
+                                initiatorPeerId = btoa(incomingCallState.value.initiator).replace(/=/g, '');
+                            }
+
+                            if (initiatorPeerId) {
+                                const outboundCall = peerInstance.call(initiatorPeerId, localStream.value);
+                                handlePeerStream(outboundCall, incomingCallState.value.initiator);
+                            }
                         }
+
+                        // Remove the private incoming invite document
+                        const targetInviteRef = doc(db, 'artifacts', appId, 'users', user.value.email, 'incoming_call', 'current');
+                        await deleteDoc(targetInviteRef);
 
                         startCallTimer();
                     } catch (err) {
@@ -789,7 +854,13 @@
                 /* Reject incoming direct call */
                 const declineCall = async () => {
                     const roomId = getRoomId(activeChat.value);
-                    if (!db || !roomId) return;
+                    if (!db || !roomId || !user.value) return;
+
+                    // Delete global incoming invite
+                    const targetInviteRef = doc(db, 'artifacts', appId, 'users', user.value.email, 'incoming_call', 'current');
+                    await deleteDoc(targetInviteRef);
+
+                    // Also tear down room call state
                     const docRef = doc(db, 'artifacts', appId, 'rooms', roomId, 'call_state', 'current');
                     await deleteDoc(docRef);
                     incomingCallState.value = null;
@@ -812,6 +883,10 @@
                     remoteStreams.value = {};
 
                     if (db && roomId && user.value) {
+                        // Delete global invite if any remains
+                        const targetInviteRef = doc(db, 'artifacts', appId, 'users', user.value.email, 'incoming_call', 'current');
+                        await deleteDoc(targetInviteRef).catch(() => {});
+
                         const docRef = doc(db, 'artifacts', appId, 'rooms', roomId, 'call_state', 'current');
                         
                         try {
@@ -824,12 +899,13 @@
                                     // Empty room call sessions get completely recycled
                                     await deleteDoc(docRef);
                                 } else {
-                                    // Remove ourselves from state list
-                                    const pathName = `peerIds.${user.value.email.replace(/\./g, '_')}`;
-                                    await updateDoc(docRef, {
-                                        participants: arrayRemove(user.value.email),
-                                        [pathName]: deleteField() // Handled elegantly by general merge update or fallback overwrite
-                                    });
+                                    // Remove ourselves from state list and clean up Peer ID
+                                    const safeEmailKey = user.value.email.replace(/\./g, '_');
+                                    const updatePayload = {
+                                        participants: arrayRemove(user.value.email)
+                                    };
+                                    updatePayload[`peerIds.${safeEmailKey}`] = deleteField();
+                                    await updateDoc(docRef, updatePayload);
                                 }
                             }
                         } catch (err) {
